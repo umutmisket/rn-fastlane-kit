@@ -1,0 +1,26 @@
+{
+  "name": "rn-fastlane-kit",
+  "version": "1.0.0",
+  "description": "Interactive fastlane setup generator for bare React Native projects — asks for the Android/iOS identifiers and secrets, then writes a project-agnostic Fastfile/Appfile so a copied setup never leaks another project's ids.",
+  "bin": {
+    "rn-fastlane-kit": "setup.js"
+  },
+  "files": [
+    "setup.js",
+    "templates",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "fastlane",
+    "react-native",
+    "generator",
+    "scaffold",
+    "cli",
+    "ios",
+    "android"
+  ],
+  "license": "MIT"
+}
