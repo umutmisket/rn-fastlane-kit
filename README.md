@@ -40,7 +40,7 @@ Secrets (ASC API key, keystore passwords) go to `fastlane/.env` (gitignored).
 From the target React Native project root:
 
 ```bash
-npx github:BNSTECH/rn-fastlane-kit
+npx github:umutmisket/rn-fastlane-kit
 ```
 
 No install, no copying — `npx` pulls the latest from GitHub and runs the generator.
