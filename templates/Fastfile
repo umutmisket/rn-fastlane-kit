@@ -9,10 +9,12 @@
 #   Single source: package.json -> version. Bumped ONCE PER CYCLE (`fastlane bump`).
 #   Standard semver: a minor/major bump zeroes the patch (1.2.4 -> 1.3.0 -> 2.0.0).
 #
-# Build number (Android versionCode / iOS build) = which upload of that version.
-#   AUTOMATIC: highest in the store + 1. Never reset. You never set it by hand.
+# Build number (Android versionCode / iOS CFBundleVersion) = which upload of that version.
+#   AUTOMATIC: derived from the marketing version + an iteration counter read from the
+#   store. Never reset, never set by hand.
 #   stg and prod ship to the same app, so they share one counter (no collisions).
-#   (iOS and Android come from their own store history, so the numbers may differ — fine.)
+#   The two platforms carry the same information; only the ENCODING differs, so each has
+#   its own template in project.json -> build_number (see "Build number scheme" below).
 #
 # Environment (stg/prod) = one app, API selected at build time.
 #   The lane sets APP_ENV=stg|prod; react-native-dotenv resolves .env/.env.prod and
@@ -48,6 +50,29 @@ IOS_WORKSPACE    = CONFIG.fetch("ios_workspace").freeze
 PLAY_JSON        = CONFIG.fetch("android_play_json", "fastlane/play-service-account.json").freeze
 API_URL_ENV_KEY  = CONFIG["api_url_env_key"] # optional; used only for a log line
 ANDROID_LOCALES  = CONFIG.fetch("android_changelog_locales", ["en-US"]).freeze
+
+# ── Build number scheme ───────────────────────────────────────────────────────
+# A build number encodes the marketing version plus an iteration ("which upload of this
+# version is this"). Projects disagree on how to pack that into a number, so each platform
+# gets a template. Fields: {major} {minor} {patch} {iteration}; ":width" zero-pads.
+#
+#   "{major}{minor:1}{patch:1}{iteration:2}"   7.4.7 #2 -> 74702     (packed — the default)
+#   "{major}{minor:2}{patch:1}{iteration:2}"   7.4.7 #2 -> 704702    (packed, wide minor)
+#   "{major}.{minor}.{patch}{iteration:2}"     7.4.7 #2 -> 7.4.702   (dotted — iOS only)
+#
+# Rule: a field that directly follows another field with no separator between them MUST
+# declare a width, or its digits smear into the neighbour as soon as it reaches two digits.
+# Android must stay a plain integer (versionCode); iOS may use dots (CFBundleVersion).
+DEFAULT_BUILD_TEMPLATE = "{major}{minor:1}{patch:1}{iteration:2}".freeze
+BUILD_TEMPLATES = {
+  "android" => (CONFIG.dig("build_number", "android") || DEFAULT_BUILD_TEMPLATE).freeze,
+  "ios"     => (CONFIG.dig("build_number", "ios")     || DEFAULT_BUILD_TEMPLATE).freeze,
+}.freeze
+BUILD_FIELDS = %w[major minor patch iteration].freeze
+BUILD_TOKEN  = /\{(\w+)(?::(\d+))?\}/.freeze
+# The iteration ceiling follows the width the template reserves for it, so widening the
+# field actually buys you more uploads: {iteration:2} -> 99, {iteration:3} -> 999.
+DEFAULT_MAX_ITERATION = 99
 
 # For logging only: reads the base URL from the matching .env file so the console shows
 # which API a build points at. Falls back to the env name if not configured/found.
@@ -87,19 +112,89 @@ def bump_version(current, type)
   end
 end
 
-# Derives the build number from the marketing version (iOS build = Android versionCode).
-#   prefix    = major*10000 + minor*1000 + patch*100      (7.2.6 -> 72600)
-#   iteration = highest store build for this version + 1, else 1  (01..99)
-#   build     = prefix + iteration                          (7.2.6 first upload -> 72601)
-# existing_codes: build/versionCode list read from the store (any range).
-def derive_build_number(existing_codes)
+# Fails fast on a template that cannot produce monotonically increasing build numbers.
+def validate_build_template!(platform, template)
+  tokens = template.scan(BUILD_TOKEN)
+  UI.user_error!("build_number.#{platform} has no {field} placeholders: #{template}") if tokens.empty?
+
+  unknown = tokens.map(&:first) - BUILD_FIELDS
+  UI.user_error!("build_number.#{platform}: unknown field(s) #{unknown.map { |f| "{#{f}}" }.join(', ')} (allowed: #{BUILD_FIELDS.join(', ')})") if unknown.any?
+
+  missing = BUILD_FIELDS - tokens.map(&:first)
+  UI.user_error!("build_number.#{platform} is missing #{missing.map { |f| "{#{f}}" }.join(', ')}: #{template}") if missing.any?
+
+  if platform == "android" && template.include?(".")
+    UI.user_error!("build_number.android must render a plain integer (versionCode) — dots are not allowed: #{template}")
+  end
+
+  # Split into runs of adjacent fields; within a run only the first may be variable-width.
+  template.split(/[^{}\w:]+/).each do |run|
+    run.scan(BUILD_TOKEN).drop(1).each do |name, width|
+      next if width
+      UI.user_error!("build_number.#{platform}: '{#{name}}' directly follows another field, so it must declare a width (e.g. {#{name}:1}): #{template}")
+    end
+  end
+end
+
+def render_build_number(template, major, minor, patch, iteration)
+  values = { "major" => major, "minor" => minor, "patch" => patch, "iteration" => iteration }
+  template.gsub(BUILD_TOKEN) do
+    name  = Regexp.last_match(1)
+    width = Regexp.last_match(2)&.to_i
+    value = values.fetch(name).to_s
+    if width && value.length > width
+      UI.user_error!("#{major}.#{minor}.#{patch} iteration #{iteration}: '{#{name}}' is #{value} but the template reserves only #{width} digit(s) (#{template}). Widen it in fastlane/project.json, or bump to a new version.")
+    end
+    width ? value.rjust(width, "0") : value
+  end
+end
+
+# Renders every build number this version could possibly have and matches them against what
+# the store already has. Rendering forward means we never have to parse a
+# build number back apart, which is what makes an arbitrary template safe.
+# existing: build/versionCode values read from the store (any version, any range).
+# Returns [next_build_string, existing_values_that_matched_no_candidate].
+def derive_build_number(template, existing)
   major, minor, patch = marketing_version.split(".").map(&:to_i)
-  UI.user_error!("Version scheme requires single-digit minor and patch (0-9): #{major}.#{minor}.#{patch}") if minor > 9 || patch > 9
-  prefix = major * 10000 + minor * 1000 + patch * 100
-  in_range = existing_codes.map(&:to_i).select { |c| c > prefix && c < prefix + 100 }
-  iteration = in_range.empty? ? 1 : (in_range.max - prefix + 1)
-  UI.user_error!("Iteration exceeded 99 for this version (prefix #{prefix}). Do a new patch/minor bump.") if iteration > 99
-  prefix + iteration
+  max_iteration = max_iteration_for(template)
+  # A packed versionCode loses leading zeros on its way through the store, so compare packed
+  # templates numerically and dotted ones literally.
+  norm = template.include?(".") ? ->(v) { v.to_s.strip } : ->(v) { v.to_s.strip.to_i.to_s }
+
+  by_key = {}
+  (1..max_iteration).each { |i| by_key[norm.call(render_build_number(template, major, minor, patch, i))] = i }
+
+  seen      = existing.map { |v| norm.call(v) }.reject { |v| v.empty? || v == "0" }.uniq
+  used      = seen.map { |k| by_key[k] }.compact
+  unmatched = seen.reject { |k| by_key.key?(k) }
+
+  iteration = used.empty? ? 1 : used.max + 1
+  if iteration > max_iteration
+    UI.user_error!("Iteration #{max_iteration} exhausted for #{major}.#{minor}.#{patch} — run `fastlane bump` for a new version.")
+  end
+  [render_build_number(template, major, minor, patch, iteration), unmatched]
+end
+
+# How many uploads a template can label for one marketing version, from the width it reserves
+# for {iteration}. An undeclared width can't be counted on, so it keeps the safe default.
+def max_iteration_for(template)
+  width = template[/\{iteration(?::(\d+))?\}/, 1]
+  width ? 10**width.to_i - 1 : DEFAULT_MAX_ITERATION
+end
+
+# package.json is the only source of the marketing version, and nothing keeps it in step with
+# the store. Once it falls behind, every code we derive lands at or below one the store already
+# has and the upload is rejected — but only after a full native build and a slow upload. The
+# store's own history is already in hand here, so the mismatch is free to catch up front.
+# Packed integers only (Android): a dotted build number has no meaningful .to_i.
+def ensure_ahead_of_store!(build, existing, version_name)
+  highest = existing.map(&:to_i).max
+  return if highest.nil? || build.to_i > highest
+  UI.user_error!(
+    "package.json is at v#{version_name}, which derives versionCode #{build} — but the store already " \
+    "has #{highest}. A release must raise the versionCode, so this build would be rejected on upload. " \
+    "package.json has fallen behind the store: set it to the real store version, then `fastlane bump`."
+  )
 end
 
 # ── Release-note helpers ──────────────────────────────────────────────────────
@@ -177,6 +272,9 @@ private_lane :android_ship do |options|
   track  = options[:track]
   status = options[:release_status] || "draft"
 
+  template = BUILD_TEMPLATES.fetch("android")
+  validate_build_template!("android", template)
+
   version_name = marketing_version
   notes = read_release_notes
   write_android_changelogs(notes)
@@ -192,7 +290,10 @@ private_lane :android_ship do |options|
       UI.message("Track '#{t}' unreadable (#{e.message}) — skipping.")
     end
   end
-  build = derive_build_number(existing)
+  # `existing` spans every version on every track, so unmatched codes are entirely normal
+  # here (they belong to other versions) — nothing to report.
+  build, _unmatched = derive_build_number(template, existing)
+  ensure_ahead_of_store!(build, existing, version_name)
 
   ENV["APP_ENV"] = env
   UI.message("Android #{env}: v#{version_name} (build #{build}) -> #{resolve_api_url(env)}")
@@ -227,6 +328,9 @@ end
 private_lane :ios_ship do |options|
   env = options[:env]
 
+  template = BUILD_TEMPLATES.fetch("ios")
+  validate_build_template!("ios", template)
+
   version_name = marketing_version
   notes = read_release_notes
 
@@ -244,7 +348,17 @@ private_lane :ios_ship do |options|
     version: version_name,
     initial_build_number: 0
   )
-  build = derive_build_number(latest.to_i > 0 ? [latest] : [])
+  # Unlike Android, this is a single value scoped to THIS version — so if it matches no
+  # candidate the store and the template disagree, and guessing would collide. Fail loudly.
+  build, unmatched = derive_build_number(template, [latest])
+  unless unmatched.empty?
+    UI.user_error!(
+      "TestFlight's highest build for v#{version_name} is '#{unmatched.first}', which no iteration " \
+      "of build_number.ios (#{template}) can produce. Either the template changed mid-version, or " \
+      "that build predates it. Fix the template in fastlane/project.json, or `fastlane bump` to a " \
+      "new marketing version and start its counter fresh."
+    )
+  end
 
   ENV["APP_ENV"] = env
   UI.message("iOS #{env}: v#{version_name} (build #{build}) -> #{resolve_api_url(env)}")
@@ -261,7 +375,7 @@ private_lane :ios_ship do |options|
   profile_name = lane_context[SharedValues::SIGH_NAME]
 
   # Pass -allowProvisioningUpdates + API-key auth to ARCHIVE manually (gym doesn't add it).
-  asc_key_abs = File.expand_path(ENV["ASC_KEY_PATH"] || "fastlane/fastlane-api-key.p8", REPO_ROOT)
+  asc_key_abs = File.expand_path(ENV["ASC_KEY_PATH"] || "fastlane/appstore_api_key.p8", REPO_ROOT)
   archive_auth = "-allowProvisioningUpdates " \
                  "-authenticationKeyPath #{asc_key_abs.shellescape} " \
                  "-authenticationKeyID #{ENV['ASC_KEY_ID']} " \

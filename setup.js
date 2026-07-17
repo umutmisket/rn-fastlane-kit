@@ -76,6 +76,59 @@ async function askYesNo(label, defYes) {
   return a === 'y' || a === 'yes' || a === 'e' || a === 'evet';
 }
 
+// ── build number templates ────────────────────────────────────────────────────
+// Mirrors the Fastfile's scheme: the build number encodes the marketing version plus an
+// iteration counter, and only the ENCODING differs per platform. Kept in sync with
+// validate_build_template! in templates/Fastfile.
+const BUILD_FIELDS = ['major', 'minor', 'patch', 'iteration'];
+const BUILD_TOKEN = /\{(\w+)(?::(\d+))?\}/g;
+const BUILD_PRESETS = {
+  compact: {
+    android: '{major}{minor:1}{patch:1}{iteration:2}',
+    ios: '{major}{minor:1}{patch:1}{iteration:2}',
+  },
+  wide: {
+    android: '{major}{minor:2}{patch:1}{iteration:2}',
+    ios: '{major}.{minor}.{patch}{iteration:2}',
+  },
+};
+
+function tokensOf(template) {
+  return [...template.matchAll(BUILD_TOKEN)].map((m) => ({ name: m[1], width: m[2] }));
+}
+
+// Returns an error string, or null when the template is usable.
+function validateBuildTemplate(platform, template) {
+  const tokens = tokensOf(template);
+  if (!tokens.length) return `{alan} yer tutucusu yok: ${template}`;
+
+  const unknown = tokens.map((t) => t.name).filter((n) => !BUILD_FIELDS.includes(n));
+  if (unknown.length) return `bilinmeyen alan: ${unknown.map((n) => `{${n}}`).join(', ')} (geçerli: ${BUILD_FIELDS.join(', ')})`;
+
+  const missing = BUILD_FIELDS.filter((f) => !tokens.some((t) => t.name === f));
+  if (missing.length) return `eksik alan: ${missing.map((f) => `{${f}}`).join(', ')}`;
+
+  if (platform === 'android' && template.includes('.')) {
+    return 'Android versionCode tam sayı olmalı — nokta kullanılamaz';
+  }
+  // Within a run of adjacent fields only the first may be variable-width.
+  for (const run of template.split(/[^{}\w:]+/)) {
+    for (const t of tokensOf(run).slice(1)) {
+      if (!t.width) return `'{${t.name}}' başka bir alanın hemen ardında geliyor, genişlik belirtmeli (ör. {${t.name}:1})`;
+    }
+  }
+  return null;
+}
+
+// Renders a sample so the chosen scheme can be eyeballed before it's written.
+function renderBuildNumber(template, major, minor, patch, iteration) {
+  const values = { major, minor, patch, iteration };
+  return template.replace(BUILD_TOKEN, (_m, name, width) => {
+    const v = String(values[name]);
+    return width ? v.padStart(Number(width), '0') : v;
+  });
+}
+
 // ── detection ─────────────────────────────────────────────────────────────────
 function readSafe(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch { return ''; }
@@ -115,6 +168,38 @@ function detectAppName() {
   catch { return ''; }
 }
 
+// Marketing version is shared across platforms; only the build-number encoding differs.
+async function askBuildScheme() {
+  const sample = (tpl) => renderBuildNumber(tpl, 7, 4, 7, 2);
+  console.log('\n── Build number şeması ───────────────────');
+  console.log('Marketing version her iki platformda aynıdır (package.json -> version).');
+  console.log('Build number (Android versionCode / iOS CFBundleVersion) versiondan + o sürümün');
+  console.log('kaçıncı yüklemesi olduğundan otomatik türetilir; sadece yazımı değişir.');
+  console.log('Örnek: marketing version 7.4.7, o sürümün 2. yüklemesi ->\n');
+  console.log(`  1) compact   Android ${sample(BUILD_PRESETS.compact.android)}   iOS ${sample(BUILD_PRESETS.compact.ios)}`);
+  console.log(`  2) wide      Android ${sample(BUILD_PRESETS.wide.android)}  iOS ${sample(BUILD_PRESETS.wide.ios)}`);
+  console.log('  3) custom    (template\'leri elle gir)\n');
+
+  const choice = await ask('Seçim (1/2/3)', '1');
+  if (choice === '2') return { ...BUILD_PRESETS.wide };
+  if (choice !== '3') return { ...BUILD_PRESETS.compact };
+
+  console.log('\nAlanlar: {major} {minor} {patch} {iteration}. ":N" = N haneye sıfırla doldur.');
+  console.log('Bir alan başka bir alanın hemen ardında geliyorsa genişlik belirtmeli.');
+  const out = {};
+  for (const platform of ['android', 'ios']) {
+    for (;;) {
+      const tpl = await ask(`  ${platform} template`, BUILD_PRESETS.compact[platform]);
+      const err = validateBuildTemplate(platform, tpl);
+      if (err) { console.log(`  ⚠️  ${err}`); continue; }
+      console.log(`  ✓ 7.4.7 #2 -> ${renderBuildNumber(tpl, 7, 4, 7, 2)}`);
+      out[platform] = tpl;
+      break;
+    }
+  }
+  return out;
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('\n🚀 fastlane-kit setup\n');
@@ -138,6 +223,8 @@ async function main() {
 
   console.log('\n── Android Play ──────────────────────────');
   const android_play_json = await ask('Play service-account.json yolu', 'fastlane/play-service-account.json');
+
+  const build_number = await askBuildScheme();
 
   console.log('\n── Sürüm notu / changelog ────────────────');
   const locale = await ask('Play changelog locale', 'tr-TR');
@@ -167,6 +254,7 @@ async function main() {
     ios_scheme,
     ios_workspace,
     android_changelog_locales: [locale],
+    build_number,
   };
   if (api_url_env_key) config.api_url_env_key = api_url_env_key;
 
@@ -187,6 +275,13 @@ async function main() {
   await writeGuarded(path.join(FASTLANE_DIR, 'project.json'), JSON.stringify(config, null, 2) + '\n');
   await writeGuarded(path.join(FASTLANE_DIR, 'Fastfile'), readSafe(path.join(TEMPLATES_DIR, 'Fastfile')));
   await writeGuarded(path.join(FASTLANE_DIR, 'Appfile'), readSafe(path.join(TEMPLATES_DIR, 'Appfile')));
+
+  // Created empty on purpose: the Fastfile refuses to ship on an empty release note, so an
+  // unwritten note fails the lane instead of shipping placeholder text to the store.
+  if (!fs.existsSync(path.join(FASTLANE_DIR, 'release_notes.txt'))) {
+    fs.writeFileSync(path.join(FASTLANE_DIR, 'release_notes.txt'), '');
+    console.log('  yazıldı: fastlane/release_notes.txt (boş — sürüm notunu buraya yaz)');
+  }
 
   const envExample = readSafe(path.join(TEMPLATES_DIR, 'env.example'));
   await writeGuarded(path.join(FASTLANE_DIR, '.env.example'), envExample);
@@ -247,7 +342,9 @@ function printNextSteps() {
   console.log('2. fastlane/.env içindeki keystore/ASC değerlerini doğrula.');
   console.log('3. Android imzalama + release guard\'ı android/app/build.gradle\'a ekle');
   console.log('   (rn-fastlane-kit README\'deki snippet).');
-  console.log('4. Test: fastlane android stg   |   fastlane ios stg');
+  console.log('4. fastlane/release_notes.txt\'e sürüm notunu yaz (boşsa lane hata verir).');
+  console.log('5. package.json -> version gerçek store sürümü olsun (build number oradan türer).');
+  console.log('6. Test: fastlane android stg   |   fastlane ios stg');
   console.log('────────────────────────────────────────────────────────');
 }
 

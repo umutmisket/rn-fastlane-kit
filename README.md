@@ -25,7 +25,11 @@ file, `fastlane/project.json`:
   "ios_workspace":   "ios/myapp.xcworkspace",
   "android_play_json": "fastlane/play-service-account.json",
   "android_changelog_locales": ["tr-TR"],
-  "api_url_env_key": "MYAPP_BASE_URL"       // optional, for a log line only
+  "api_url_env_key": "MYAPP_BASE_URL",      // optional, for a log line only
+  "build_number": {                          // how to encode the build number per platform
+    "android": "{major}{minor:2}{patch:1}{iteration:2}",
+    "ios":     "{major}.{minor}.{patch}{iteration:2}"
+  }
 }
 ```
 
@@ -50,6 +54,7 @@ and offers them as defaults — press Enter to accept, or type to override. Then
 | `fastlane/project.json` | yes | identifiers |
 | `fastlane/Fastfile` | yes | build/deploy lanes (identical across projects) |
 | `fastlane/Appfile` | yes | reads project.json |
+| `fastlane/release_notes.txt` | yes | created empty — write the note before shipping |
 | `fastlane/.env.example` | yes | secret template |
 | `fastlane/.env` | **no** (gitignored) | real secrets |
 
@@ -61,8 +66,14 @@ It also appends the fastlane secret patterns to the project's `.gitignore` if mi
    - App Store Connect `.p8` → the path you gave as `ASC_KEY_PATH`
    - Play `service-account.json` → the path you gave as `android_play_json`
 2. Add the Android signing + release guard to `android/app/build.gradle` (snippet below).
-3. Write `fastlane/release_notes.txt`.
-4. Test: `fastlane android stg` / `fastlane ios stg`.
+3. Write `fastlane/release_notes.txt` (scaffolded empty; the lanes refuse to ship on an
+   empty note, so it can't silently reach the store unwritten).
+4. Make sure `package.json` `version` is the **real** store version — the build number is
+   derived from it.
+5. Test: `fastlane android stg` / `fastlane ios stg`.
+
+The Play app must already exist with **one AAB uploaded manually** — the Play API can't
+create an app from scratch. Give the service account "Release manager" access.
 
 ## Lanes (in the generated Fastfile)
 
@@ -74,9 +85,50 @@ fastlane ios stg | prod       # build + TestFlight
 ```
 
 - **Marketing version** = `package.json` `version`; bumped once per cycle via `fastlane bump`.
-  Must reflect the real store version (single-digit minor/patch, e.g. `1.3.7`).
-- **Build number** (versionCode / iOS build) is derived automatically from the store's
-  highest + 1 — you never set it by hand.
+  Must reflect the real store version. The same value ships to both platforms
+  (Android `versionName`, iOS `MARKETING_VERSION`).
+- **Build number** (Android `versionCode`, iOS `CURRENT_PROJECT_VERSION`) is derived
+  automatically — you never set it by hand. See below.
+
+## Build number scheme
+
+A build number encodes the marketing version plus an **iteration** — "which upload of this
+version is this". The iteration is read back from the store (highest existing + 1), so it
+never resets and stg/prod can't collide.
+
+Both platforms carry the same information; only the *encoding* differs, and projects
+disagree on that. So each platform gets a template in `project.json` → `build_number`.
+Fields are `{major}` `{minor}` `{patch}` `{iteration}`; `:N` zero-pads to N digits.
+
+`setup.js` offers two presets — for marketing version **7.4.7**, 2nd upload:
+
+| preset | Android `versionCode` | iOS `CURRENT_PROJECT_VERSION` |
+|---|---|---|
+| `compact` (default) | `74702` | `74702` |
+| `wide` | `704702` | `7.4.702` |
+
+```jsonc
+// compact — {major}{minor:1}{patch:1}{iteration:2}  (both platforms)
+// wide    — android: {major}{minor:2}{patch:1}{iteration:2}   ->  704702
+//           ios:     {major}.{minor}.{patch}{iteration:2}     ->  7.4.702
+```
+
+Rules the Fastfile enforces before it builds anything:
+
+- A field that **directly follows another field** (no separator between) must declare a
+  width — otherwise its digits smear into the neighbour once it hits two digits.
+  `{major}{minor:2}{patch}{iteration:2}` is rejected; `{patch:1}` fixes it.
+- **Android must render a plain integer** — no dots (it's a `versionCode`). iOS may use
+  dots (`CFBundleVersion` compares dotted components numerically).
+- A value that doesn't fit its declared width is an error, not a silent overflow. With
+  `compact`, version `7.10.7` fails on `{minor:1}` — switch to `{minor:2}` (i.e. `wide`).
+
+**Changing the template mid-version:** iOS fails loudly if TestFlight's highest build for
+the current marketing version can't be produced by the template. Run `fastlane bump` for a
+new marketing version so the counter starts fresh.
+
+See **[VERSIONING.md](VERSIONING.md)** for the full scheme comparison — rendered output for
+every preset including its ceiling and overflow rows, plus the store limits behind them.
 
 ## android/app/build.gradle snippet
 
