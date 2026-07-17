@@ -3,7 +3,7 @@
  * rn-fastlane-kit — interactive fastlane setup generator.
  *
  * Run from a React Native project root:
- *   npx github:umutmisketket/rn-fastlane-kit      (or: node setup.js during local dev)
+ *   npx github:umutmisket/rn-fastlane-kit      (or: node setup.js during local dev)
  *
  * Auto-detects identifiers from the project, asks for the rest, then writes:
  *   fastlane/project.json   (identifiers — committed)
